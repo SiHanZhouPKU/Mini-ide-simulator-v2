@@ -28,7 +28,9 @@ bool Parser::atEnd() const {
 
 Token Parser::consume(TokenType type, const std::string& msg) {
     if (check(type)) return advance();
-    error_ = "第" + std::to_string(peek().lineNumber) + "行: " + msg;
+    // Don't overwrite a more specific earlier error with a later generic one
+    if (error_.empty())
+        error_ = "第" + std::to_string(peek().lineNumber) + "行: " + msg;
     return tokens_[pos_];
 }
 

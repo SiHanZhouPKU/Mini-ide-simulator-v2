@@ -295,10 +295,24 @@ bool MainWindow::loadAndParseProgram() {
     Parser parser(tokens);
     program_ = parser.parse();
 
+    // Check lexer error first
+    if (!lexer.error().empty()) {
+        QMessageBox::warning(this, "词法错误",
+            QString::fromStdString(lexer.error()));
+        return false;
+    }
+
+    // Check parser error — must check BEFORE the null-Program check
+    // since the parser may set error_ but still return a valid Program
+    // (e.g. missing ';' after a declaration)
+    if (!parser.error().empty()) {
+        QMessageBox::warning(this, "语法错误",
+            QString::fromStdString(parser.error()));
+        return false;
+    }
+
     if (!program_ || !program_->mainFunc) {
-        QString errMsg = QString::fromStdString(parser.error());
-        if (errMsg.isEmpty()) errMsg = "解析失败: 需要 int main() { ... }";
-        QMessageBox::warning(this, "解析错误", errMsg);
+        QMessageBox::warning(this, "解析错误", "解析失败: 需要 int main() { ... }");
         return false;
     }
 
