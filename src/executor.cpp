@@ -1866,20 +1866,17 @@ int Executor::execWhile(WhileStmt* stmt) {
     int lastLine = stmt->lineNumber;
     while (true) {
         if (onYield_) onYield_();
-        if (stmt->cond) {
-            VariantValue cv = evalExpr(stmt->cond.get());
-            if (!error_.empty()) break;
-            bool cb = false;
-            if (cv.type == VariantValue::BOOL) cb = std::get<bool>(cv.value);
-            else if (cv.type == VariantValue::INT) cb = (std::get<int>(cv.value) != 0);
-            else if (cv.type == VariantValue::STRING) cb = !std::get<std::string>(cv.value).empty();
-            if (!cb) break;
-        }
         lastLine = execStmt(stmt->body.get());
         if (breakRequested_) { breakRequested_ = false; break; }
-        if (continueRequested_) { continueRequested_ = false; }
+        if (continueRequested_) { continueRequested_ = false; continue; }
         if (!error_.empty()) break;
-        if (stmt->update) { evalExpr(stmt->update.get()); if (!error_.empty()) break; }
+        cond = evalExpr(stmt->cond.get());
+        if (!error_.empty()) break;
+        b = false;
+        if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
+        else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
+        else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
+        if (!b) break;
     }
     return lastLine;
 }
