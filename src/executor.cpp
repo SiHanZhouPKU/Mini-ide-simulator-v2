@@ -951,6 +951,7 @@ VariantValue Executor::evalExpr(Expr* expr) {
             VariantValue result = callMethod(obj, ma->member, args);
             if (auto* varExpr = dynamic_cast<VarExpr*>(ma->object.get())) {
                 vars_[varExpr->name] = obj;
+                updateMemoryForVar(varExpr->name, obj);
             }
             return result;
         }
