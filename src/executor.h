@@ -77,6 +77,25 @@ private:
     // Stack for nested try/catch
     struct TryCatchState { std::vector<Stmt*> tryStmts; std::vector<Stmt*> catStmts; bool inCat; };
     std::vector<TryCatchState> tryCatchStack_;
+
+    // Sub-step state for IfStmt: expand taken branch one statement per step()
+    bool inIfSubstep_ = false;
+    std::vector<Stmt*> ifBodyStmts_;
+    size_t ifBodyPos_ = 0;
+
+    // Sub-step state for loops (For / While / DoWhile):
+    // expand body one statement per step(), re-check condition between iterations
+    bool inLoopSubstep_ = false;
+    Stmt* loopStmt_ = nullptr;
+    std::vector<Stmt*> loopBodyStmts_;
+    size_t loopBodyPos_ = 0;
+    // Stack for nested loops
+    struct LoopSubState { Stmt* stmt; std::vector<Stmt*> bodyStmts; size_t bodyPos; };
+    std::vector<LoopSubState> loopStack_;
+
+    // When true, compound statements (if/for/while) set up substep state
+    // instead of executing recursively.  Set by step(), cleared by runAll().
+    bool stepMode_ = false;
     std::stringstream consoleOut_;
     std::string error_;
     bool finished_ = false;
@@ -128,6 +147,8 @@ private:
     // ======== Helpers ========
     void takeSnapshot(int line);
     void collectStmts(Stmt* stmt, std::vector<Stmt*>& out);
+    void expandStmtBody(Stmt* body, std::vector<Stmt*>& out);
+    void loopContinueOrFinish();
     VariantValue castToType(const VariantValue& val, const std::string& typeName);
     VariantValue* findVariable(const std::string& name);
 

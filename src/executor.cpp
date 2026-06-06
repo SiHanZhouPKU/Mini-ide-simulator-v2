@@ -32,6 +32,15 @@ void Executor::reset() {
     catchStmts_.clear();
     inCatch_ = false;
     tryCatchStack_.clear();
+    inIfSubstep_ = false;
+    ifBodyStmts_.clear();
+    ifBodyPos_ = 0;
+    inLoopSubstep_ = false;
+    loopStmt_ = nullptr;
+    loopBodyStmts_.clear();
+    loopBodyPos_ = 0;
+    loopStack_.clear();
+    stepMode_ = false;
     while (!exceptionStack_.empty()) exceptionStack_.pop();
     nextAddress_ = 0x1000;
     memoryMap_.clear();
@@ -45,6 +54,7 @@ bool Executor::isFinished() const { return finished_; }
 void Executor::runAll() {
     if (!prog_ || !prog_->mainFunc) return;
     reset();
+    stepMode_ = false;  // runAll uses recursive execution, not substep
     // Directly execute main function body — compound statements
     // (if/while/for) handle their own recursion via execIf/execWhile/execFor.
     // No more pre-flattening, which caused double-execution of both if branches.
@@ -72,10 +82,65 @@ void Executor::collectStmts(Stmt* stmt, std::vector<Stmt*>& out) {
     }
 }
 
+void Executor::expandStmtBody(Stmt* body, std::vector<Stmt*>& out) {
+    if (auto* blk = dynamic_cast<BlockStmt*>(body)) {
+        for (auto& s : blk->stmts) out.push_back(s.get());
+    } else if (body) {
+        out.push_back(body);
+    }
+}
+
+void Executor::loopContinueOrFinish() {
+    auto* fs = dynamic_cast<ForStmt*>(loopStmt_);
+    auto* ws = dynamic_cast<WhileStmt*>(loopStmt_);
+    auto* dw = dynamic_cast<DoWhileStmt*>(loopStmt_);
+
+    // Execute update expression (for-loop only)
+    if (fs && fs->update) {
+        evalExpr(fs->update.get());
+        if (!error_.empty()) { inLoopSubstep_ = false; return; }
+    }
+
+    // Re-evaluate condition
+    bool shouldContinue = false;
+    if (fs && fs->cond) {
+        VariantValue cond = evalExpr(fs->cond.get());
+        if (cond.type == VariantValue::BOOL) shouldContinue = std::get<bool>(cond.value);
+        else if (cond.type == VariantValue::INT) shouldContinue = (std::get<int>(cond.value) != 0);
+        else if (cond.type == VariantValue::STRING) shouldContinue = !std::get<std::string>(cond.value).empty();
+    } else if (ws) {
+        VariantValue cond = evalExpr(ws->cond.get());
+        if (cond.type == VariantValue::BOOL) shouldContinue = std::get<bool>(cond.value);
+        else if (cond.type == VariantValue::INT) shouldContinue = (std::get<int>(cond.value) != 0);
+        else if (cond.type == VariantValue::STRING) shouldContinue = !std::get<std::string>(cond.value).empty();
+    } else if (dw) {
+        VariantValue cond = evalExpr(dw->cond.get());
+        if (cond.type == VariantValue::BOOL) shouldContinue = std::get<bool>(cond.value);
+        else if (cond.type == VariantValue::INT) shouldContinue = (std::get<int>(cond.value) != 0);
+        else if (cond.type == VariantValue::STRING) shouldContinue = !std::get<std::string>(cond.value).empty();
+    } else if (fs) {
+        // for-loop without condition → infinite loop
+        shouldContinue = true;
+    }
+
+    if (!shouldContinue) {
+        inLoopSubstep_ = false;
+        return;
+    }
+
+    // Re-load body for next iteration
+    loopBodyStmts_.clear();
+    loopBodyPos_ = 0;
+    Stmt* body = fs ? fs->body.get() : (ws ? ws->body.get() : (dw ? dw->body.get() : nullptr));
+    if (body) expandStmtBody(body, loopBodyStmts_);
+}
+
 void Executor::step() {
     if (finished_ || !prog_ || !prog_->mainFunc) return;
     if (!error_.empty()) return;
     if (error_.empty() && unwinding_) return;
+
+    stepMode_ = true;   // compound stmts set up substep instead of recursing
 
     if (stepQueue_.empty() && stepPos_ == 0) {
         std::vector<Stmt*> allStmts;
@@ -84,7 +149,11 @@ void Executor::step() {
         stepQueue_ = allStmts;
     }
 
-    // Sub-step: execute one try/catch inner statement per step()
+    // ================================================================
+    // Sub-step handlers — execute ONE inner statement per step() call
+    // ================================================================
+
+    // -- try / catch substep -----------------------------------------
     if (inTryCatch_) {
         if (tryCatchStmts_.empty()) {
             // Finish current try/catch, pop outer state if nested
@@ -132,6 +201,68 @@ void Executor::step() {
         }
         return;
     }
+
+    // -- if / else-if substep ---------------------------------------
+    if (inIfSubstep_) {
+        if (ifBodyPos_ < ifBodyStmts_.size()) {
+            Stmt* cur = ifBodyStmts_[ifBodyPos_++];
+            int line = execStmt(cur);
+            if (!error_.empty()) { inIfSubstep_ = false; return; }
+            takeSnapshot(cur->lineNumber); executedCount_++;
+            return;
+        }
+        // all body statements done
+        inIfSubstep_ = false;
+        return;
+    }
+
+    // -- loop (for / while / do-while) substep ----------------------
+    if (inLoopSubstep_) {
+        if (loopBodyPos_ < loopBodyStmts_.size()) {
+            Stmt* cur = loopBodyStmts_[loopBodyPos_++];
+            int line = execStmt(cur);
+            if (!error_.empty()) { inLoopSubstep_ = false; return; }
+            if (breakRequested_) {
+                breakRequested_ = false; inLoopSubstep_ = false; return;
+            }
+            if (continueRequested_) {
+                continueRequested_ = false;
+                // skip remaining body statements this iteration
+                loopBodyPos_ = loopBodyStmts_.size();
+            }
+            takeSnapshot(cur->lineNumber); executedCount_++;
+            return;
+        }
+        // Body done — execute update (for-loop), re-check condition,
+        // reload body for next iteration or finish.
+        loopContinueOrFinish();
+
+        // If inner loop ended, restore outer loop state from stack
+        while (!inLoopSubstep_ && !loopStack_.empty()) {
+            auto saved = std::move(loopStack_.back());
+            loopStack_.pop_back();
+            loopStmt_ = saved.stmt;
+            loopBodyStmts_ = std::move(saved.bodyStmts);
+            loopBodyPos_ = saved.bodyPos + 1;  // advance past the compound stmt
+            inLoopSubstep_ = true;
+            // If outer body also exhausted, re-check outer condition
+            if (loopBodyPos_ >= loopBodyStmts_.size())
+                loopContinueOrFinish();
+        }
+
+        if (inLoopSubstep_ && loopBodyPos_ < loopBodyStmts_.size()) {
+            // kick off first stmt of the new iteration immediately
+            Stmt* cur = loopBodyStmts_[loopBodyPos_++];
+            int line = execStmt(cur);
+            if (!error_.empty()) { inLoopSubstep_ = false; return; }
+            takeSnapshot(cur->lineNumber); executedCount_++;
+        }
+        return;
+    }
+
+    // ================================================================
+    // Normal execution — next top-level statement
+    // ================================================================
 
     if (stepPos_ >= stepQueue_.size()) {
         finished_ = true;
@@ -1691,34 +1822,81 @@ int Executor::execIf(IfStmt* stmt) {
     if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
     else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
     else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
-    if (b) {
-        return execStmt(stmt->thenBody.get());
-    } else if (stmt->elseBody) {
-        return execStmt(stmt->elseBody.get());
+
+    Stmt* target = b ? stmt->thenBody.get() : (stmt->elseBody ? stmt->elseBody.get() : nullptr);
+    if (!target) return stmt->lineNumber;
+
+    if (stepMode_) {
+        // Substip: expand taken branch, execute one inner stmt per step()
+        ifBodyStmts_.clear();
+        ifBodyPos_ = 0;
+        expandStmtBody(target, ifBodyStmts_);
+        inIfSubstep_ = true;
+        return stmt->lineNumber;
     }
-    return stmt->lineNumber;
+
+    // runAll mode: execute recursively
+    return execStmt(target);
 }
 
 int Executor::execWhile(WhileStmt* stmt) {
+    // Evaluate condition once (for both modes)
+    VariantValue cond = evalExpr(stmt->cond.get());
+    if (!error_.empty()) return stmt->lineNumber;
+    bool b = false;
+    if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
+    else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
+    else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
+    if (!b) return stmt->lineNumber;  // condition false → skip loop
+
+    if (stepMode_) {
+        // Substep: expand body, execute one inner stmt per step()
+        if (inLoopSubstep_) {
+            loopStack_.push_back({loopStmt_, std::move(loopBodyStmts_), loopBodyPos_});
+        }
+        loopBodyStmts_.clear();
+        loopBodyPos_ = 0;
+        loopStmt_ = stmt;
+        expandStmtBody(stmt->body.get(), loopBodyStmts_);
+        inLoopSubstep_ = true;
+        return stmt->lineNumber;
+    }
+
+    // runAll mode: execute all iterations
     int lastLine = stmt->lineNumber;
     while (true) {
         if (onYield_) onYield_();
-        VariantValue cond = evalExpr(stmt->cond.get());
-        if (!error_.empty()) return stmt->lineNumber;
-        bool b = false;
-        if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
-        else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
-        else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
-        if (!b) break;
+        if (stmt->cond) {
+            VariantValue cv = evalExpr(stmt->cond.get());
+            if (!error_.empty()) break;
+            bool cb = false;
+            if (cv.type == VariantValue::BOOL) cb = std::get<bool>(cv.value);
+            else if (cv.type == VariantValue::INT) cb = (std::get<int>(cv.value) != 0);
+            else if (cv.type == VariantValue::STRING) cb = !std::get<std::string>(cv.value).empty();
+            if (!cb) break;
+        }
         lastLine = execStmt(stmt->body.get());
         if (breakRequested_) { breakRequested_ = false; break; }
-        if (continueRequested_) { continueRequested_ = false; continue; }
+        if (continueRequested_) { continueRequested_ = false; }
         if (!error_.empty()) break;
+        if (stmt->update) { evalExpr(stmt->update.get()); if (!error_.empty()) break; }
     }
     return lastLine;
 }
 
 int Executor::execDoWhile(DoWhileStmt* stmt) {
+    if (stepMode_) {
+        // Substep: expand body, execute one inner stmt per step()
+        // (do-while always executes body at least once)
+        loopBodyStmts_.clear();
+        loopBodyPos_ = 0;
+        loopStmt_ = stmt;
+        expandStmtBody(stmt->body.get(), loopBodyStmts_);
+        inLoopSubstep_ = true;
+        return stmt->lineNumber;
+    }
+
+    // runAll mode: execute all iterations
     int lastLine = stmt->lineNumber;
     do {
         if (onYield_) onYield_();
@@ -1738,23 +1916,48 @@ int Executor::execDoWhile(DoWhileStmt* stmt) {
 
 int Executor::execFor(ForStmt* stmt) {
     if (stmt->init) { execStmt(stmt->init.get()); if (!error_.empty()) return stmt->lineNumber; }
+
+    if (stmt->cond) {
+        VariantValue cond = evalExpr(stmt->cond.get());
+        if (!error_.empty()) return stmt->lineNumber;
+        bool b = false;
+        if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
+        else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
+        else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
+        if (!b) return stmt->lineNumber;  // condition false → skip loop
+    }
+
+    if (stepMode_) {
+        // Substep: expand body, execute one inner stmt per step()
+        if (inLoopSubstep_) {
+            loopStack_.push_back({loopStmt_, std::move(loopBodyStmts_), loopBodyPos_});
+        }
+        loopBodyStmts_.clear();
+        loopBodyPos_ = 0;
+        loopStmt_ = stmt;
+        expandStmtBody(stmt->body.get(), loopBodyStmts_);
+        inLoopSubstep_ = true;
+        return stmt->lineNumber;
+    }
+
+    // runAll mode: execute all iterations
     int lastLine = stmt->lineNumber;
     while (true) {
         if (onYield_) onYield_();
+        lastLine = execStmt(stmt->body.get());
+        if (breakRequested_) { breakRequested_ = false; break; }
+        if (continueRequested_) { continueRequested_ = false; }
+        if (!error_.empty()) break;
+        if (stmt->update) { evalExpr(stmt->update.get()); if (!error_.empty()) break; }
         if (stmt->cond) {
             VariantValue cond = evalExpr(stmt->cond.get());
-            if (!error_.empty()) return stmt->lineNumber;
+            if (!error_.empty()) break;
             bool b = false;
             if (cond.type == VariantValue::BOOL) b = std::get<bool>(cond.value);
             else if (cond.type == VariantValue::INT) b = (std::get<int>(cond.value) != 0);
             else if (cond.type == VariantValue::STRING) b = !std::get<std::string>(cond.value).empty();
             if (!b) break;
         }
-        lastLine = execStmt(stmt->body.get());
-        if (breakRequested_) { breakRequested_ = false; break; }
-        if (continueRequested_) { continueRequested_ = false; }
-        if (!error_.empty()) break;
-        if (stmt->update) { evalExpr(stmt->update.get()); if (!error_.empty()) break; }
     }
     return lastLine;
 }
