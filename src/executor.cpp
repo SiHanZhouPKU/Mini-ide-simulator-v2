@@ -1583,6 +1583,26 @@ int Executor::execAssign(AssignStmt* stmt) {
         return stmt->lineNumber;
     }
 
+    // Helper: promote LHS + RHS values to double for compound-assign
+    auto promoteToDouble = [](const VariantValue& v) -> double {
+        if (v.type == VariantValue::DOUBLE) return std::get<double>(v.value);
+        if (v.type == VariantValue::FLOAT)  return static_cast<double>(std::get<float>(v.value));
+        if (v.type == VariantValue::INT)    return static_cast<double>(std::get<int>(v.value));
+        return 0.0;
+    };
+    auto promoteToFloat = [](const VariantValue& v) -> float {
+        if (v.type == VariantValue::FLOAT)  return std::get<float>(v.value);
+        if (v.type == VariantValue::INT)    return static_cast<float>(std::get<int>(v.value));
+        if (v.type == VariantValue::DOUBLE) return static_cast<float>(std::get<double>(v.value));
+        return 0.0f;
+    };
+    auto getIntVal = [](const VariantValue& v) -> int {
+        if (v.type == VariantValue::INT)    return std::get<int>(v.value);
+        if (v.type == VariantValue::FLOAT)  return static_cast<int>(std::get<float>(v.value));
+        if (v.type == VariantValue::DOUBLE) return static_cast<int>(std::get<double>(v.value));
+        return 0;
+    };
+
     switch (stmt->op) {
     case AssignOp::EQ:
         *vp = val;
@@ -1591,22 +1611,67 @@ int Executor::execAssign(AssignStmt* stmt) {
         VariantValue cur = *vp;
         VariantValue right = evalExpr(stmt->expr.get());
         if (!error_.empty()) return stmt->lineNumber;
-        if (cur.type == VariantValue::INT && right.type == VariantValue::INT)
-            *vp = VariantValue(std::get<int>(cur.value) + std::get<int>(right.value));
-        else if (cur.type == VariantValue::STRING && right.type == VariantValue::STRING)
+        if (cur.type == VariantValue::STRING && right.type == VariantValue::STRING)
             *vp = VariantValue(std::get<std::string>(cur.value) + std::get<std::string>(right.value));
-        else if (cur.type == VariantValue::DOUBLE || right.type == VariantValue::DOUBLE) {
-            double l = cur.type == VariantValue::DOUBLE ? std::get<double>(cur.value) :
-                       (cur.type == VariantValue::FLOAT ? static_cast<double>(std::get<float>(cur.value)) : static_cast<double>(std::get<int>(cur.value)));
-            double r = right.type == VariantValue::DOUBLE ? std::get<double>(right.value) :
-                       (right.type == VariantValue::FLOAT ? static_cast<double>(std::get<float>(right.value)) : static_cast<double>(std::get<int>(right.value)));
-            *vp = VariantValue(l + r);
-        } else if (cur.type == VariantValue::FLOAT || right.type == VariantValue::FLOAT) {
-            float l = cur.type == VariantValue::FLOAT ? std::get<float>(cur.value) : static_cast<float>(std::get<int>(cur.value));
-            float r = right.type == VariantValue::FLOAT ? std::get<float>(right.value) : static_cast<float>(std::get<int>(right.value));
-            *vp = VariantValue(l + r);
-        } else
+        else if (cur.type == VariantValue::DOUBLE || right.type == VariantValue::DOUBLE)
+            *vp = VariantValue(promoteToDouble(cur) + promoteToDouble(right));
+        else if (cur.type == VariantValue::FLOAT || right.type == VariantValue::FLOAT)
+            *vp = VariantValue(promoteToFloat(cur) + promoteToFloat(right));
+        else if (cur.type == VariantValue::INT && right.type == VariantValue::INT)
+            *vp = VariantValue(std::get<int>(cur.value) + std::get<int>(right.value));
+        else
             *vp = val;
+        break;
+    }
+    case AssignOp::MINUSEQ: {
+        VariantValue cur = *vp;
+        VariantValue right = evalExpr(stmt->expr.get());
+        if (!error_.empty()) return stmt->lineNumber;
+        if (cur.type == VariantValue::DOUBLE || right.type == VariantValue::DOUBLE)
+            *vp = VariantValue(promoteToDouble(cur) - promoteToDouble(right));
+        else if (cur.type == VariantValue::FLOAT || right.type == VariantValue::FLOAT)
+            *vp = VariantValue(promoteToFloat(cur) - promoteToFloat(right));
+        else
+            *vp = VariantValue(getIntVal(cur) - getIntVal(right));
+        break;
+    }
+    case AssignOp::STAREQ: {
+        VariantValue cur = *vp;
+        VariantValue right = evalExpr(stmt->expr.get());
+        if (!error_.empty()) return stmt->lineNumber;
+        if (cur.type == VariantValue::DOUBLE || right.type == VariantValue::DOUBLE)
+            *vp = VariantValue(promoteToDouble(cur) * promoteToDouble(right));
+        else if (cur.type == VariantValue::FLOAT || right.type == VariantValue::FLOAT)
+            *vp = VariantValue(promoteToFloat(cur) * promoteToFloat(right));
+        else
+            *vp = VariantValue(getIntVal(cur) * getIntVal(right));
+        break;
+    }
+    case AssignOp::SLASHEQ: {
+        VariantValue cur = *vp;
+        VariantValue right = evalExpr(stmt->expr.get());
+        if (!error_.empty()) return stmt->lineNumber;
+        double r = promoteToDouble(right);
+        if (r == 0.0) { error_ = "除以零错误"; return stmt->lineNumber; }
+        if (cur.type == VariantValue::DOUBLE || right.type == VariantValue::DOUBLE)
+            *vp = VariantValue(promoteToDouble(cur) / r);
+        else if (cur.type == VariantValue::FLOAT || right.type == VariantValue::FLOAT)
+            *vp = VariantValue(promoteToFloat(cur) / static_cast<float>(r));
+        else {
+            int divisor = getIntVal(right);
+            if (divisor == 0) { error_ = "除以零错误"; return stmt->lineNumber; }
+            *vp = VariantValue(getIntVal(cur) / divisor);
+        }
+        break;
+    }
+    case AssignOp::PERCENTEQ: {
+        VariantValue cur = *vp;
+        VariantValue right = evalExpr(stmt->expr.get());
+        if (!error_.empty()) return stmt->lineNumber;
+        int a = getIntVal(cur);
+        int b = getIntVal(right);
+        if (b == 0) { error_ = "模零错误"; return stmt->lineNumber; }
+        *vp = VariantValue(a % b);
         break;
     }
     default:
