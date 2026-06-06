@@ -93,6 +93,13 @@ private:
     struct LoopSubState { Stmt* stmt; std::vector<Stmt*> bodyStmts; size_t bodyPos; };
     std::vector<LoopSubState> loopStack_;
 
+    // Range-for loop substep: advance through container one element per iteration
+    VariantValue rangeForContainer_;
+    int rangeForIndex_ = 0;
+    std::string rangeForVarName_;   // loop variable name
+    int getContainerSize(const VariantValue& c);
+    VariantValue getContainerElement(const VariantValue& c, int idx);
+
     // When true, compound statements (if/for/while) set up substep state
     // instead of executing recursively.  Set by step(), cleared by runAll().
     bool stepMode_ = false;

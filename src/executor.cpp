@@ -40,6 +40,9 @@ void Executor::reset() {
     loopBodyStmts_.clear();
     loopBodyPos_ = 0;
     loopStack_.clear();
+    rangeForContainer_ = VariantValue(0);
+    rangeForIndex_ = 0;
+    rangeForVarName_.clear();
     stepMode_ = false;
     while (!exceptionStack_.empty()) exceptionStack_.pop();
     nextAddress_ = 0x1000;
@@ -90,7 +93,74 @@ void Executor::expandStmtBody(Stmt* body, std::vector<Stmt*>& out) {
     }
 }
 
+int Executor::getContainerSize(const VariantValue& c) {
+    switch (c.type) {
+    case VariantValue::VECTOR_INT:    return (int)std::get<std::vector<int>>(c.value).size();
+    case VariantValue::VECTOR_FLOAT:  return (int)std::get<std::vector<float>>(c.value).size();
+    case VariantValue::VECTOR_DOUBLE: return (int)std::get<std::vector<double>>(c.value).size();
+    case VariantValue::VECTOR_STRING: return (int)std::get<std::vector<std::string>>(c.value).size();
+    case VariantValue::VECTOR_CHAR:   return (int)std::get<std::vector<char>>(c.value).size();
+    case VariantValue::VECTOR_BOOL:   return (int)std::get<std::vector<bool>>(c.value).size();
+    case VariantValue::VECTOR_OBJECT: return (int)std::get<std::vector<std::shared_ptr<RuntimeObject>>>(c.value).size();
+    case VariantValue::STRING:        return (int)std::get<std::string>(c.value).size();
+    case VariantValue::LIST_INT:  { auto& l = std::get<std::list<int>>(c.value); return (int)std::distance(l.begin(), l.end()); }
+    case VariantValue::LIST_STRING: { auto& l = std::get<std::list<std::string>>(c.value); return (int)std::distance(l.begin(), l.end()); }
+    case VariantValue::SET_INT:   { auto& s = std::get<std::set<int>>(c.value); return (int)std::distance(s.begin(), s.end()); }
+    case VariantValue::MAP_STRING_INT: return (int)std::get<std::map<std::string,int>>(c.value).size();
+    default: return 0;
+    }
+}
+
+VariantValue Executor::getContainerElement(const VariantValue& c, int idx) {
+    switch (c.type) {
+    case VariantValue::VECTOR_INT:    return VariantValue(std::get<std::vector<int>>(c.value)[idx]);
+    case VariantValue::VECTOR_FLOAT:  return VariantValue(std::get<std::vector<float>>(c.value)[idx]);
+    case VariantValue::VECTOR_DOUBLE: return VariantValue(std::get<std::vector<double>>(c.value)[idx]);
+    case VariantValue::VECTOR_STRING: return VariantValue(std::get<std::vector<std::string>>(c.value)[idx]);
+    case VariantValue::VECTOR_CHAR:   return VariantValue(std::get<std::vector<char>>(c.value)[idx]);
+    case VariantValue::VECTOR_BOOL:   return VariantValue(std::get<std::vector<bool>>(c.value)[idx]);
+    case VariantValue::STRING:        return VariantValue(std::get<std::string>(c.value)[idx]);
+    case VariantValue::LIST_INT: { auto& l = std::get<std::list<int>>(c.value); auto it = l.begin(); std::advance(it, idx); return VariantValue(*it); }
+    case VariantValue::LIST_STRING: { auto& l = std::get<std::list<std::string>>(c.value); auto it = l.begin(); std::advance(it, idx); return VariantValue(*it); }
+    case VariantValue::SET_INT: { auto& s = std::get<std::set<int>>(c.value); auto it = s.begin(); std::advance(it, idx); return VariantValue(*it); }
+    case VariantValue::MAP_STRING_INT: {
+        auto& m = std::get<std::map<std::string,int>>(c.value);
+        auto it = m.begin(); std::advance(it, idx);
+        auto pairObj = std::make_shared<RuntimeObject>();
+        pairObj->className = "pair";
+        pairObj->members["first"] = VariantValue(it->first);
+        pairObj->members["second"] = VariantValue(it->second);
+        VariantValue result;
+        result.type = VariantValue::OBJECT;
+        result.value = pairObj;
+        return result;
+    }
+    case VariantValue::VECTOR_OBJECT: {
+        auto& v = std::get<std::vector<std::shared_ptr<RuntimeObject>>>(c.value);
+        VariantValue result;
+        result.type = VariantValue::POINTER;
+        result.value = v[idx];
+        return result;
+    }
+    default: return VariantValue(0);
+    }
+}
+
 void Executor::loopContinueOrFinish() {
+    // --- Range-for loop: advance to next container element ---
+    if (auto* rf = dynamic_cast<RangeForStmt*>(loopStmt_)) {
+        rangeForIndex_++;
+        if (rangeForIndex_ >= getContainerSize(rangeForContainer_)) {
+            inLoopSubstep_ = false;
+            return;
+        }
+        vars_[rangeForVarName_] = getContainerElement(rangeForContainer_, rangeForIndex_);
+        loopBodyStmts_.clear();
+        loopBodyPos_ = 0;
+        expandStmtBody(rf->body.get(), loopBodyStmts_);
+        return;
+    }
+
     auto* fs = dynamic_cast<ForStmt*>(loopStmt_);
     auto* ws = dynamic_cast<WhileStmt*>(loopStmt_);
     auto* dw = dynamic_cast<DoWhileStmt*>(loopStmt_);
@@ -1963,6 +2033,28 @@ int Executor::execRangeFor(RangeForStmt* stmt) {
     VariantValue container = evalExpr(stmt->container.get());
     if (!error_.empty()) return stmt->lineNumber;
 
+    int total = getContainerSize(container);
+    if (total == 0) return stmt->lineNumber;  // empty container
+
+    if (stepMode_) {
+        // Substep: advance through container one element per iteration
+        rangeForContainer_ = container;
+        rangeForIndex_ = 0;
+        rangeForVarName_ = stmt->varName;
+        vars_[stmt->varName] = getContainerElement(container, 0);
+
+        if (inLoopSubstep_) {
+            loopStack_.push_back({loopStmt_, std::move(loopBodyStmts_), loopBodyPos_});
+        }
+        loopBodyStmts_.clear();
+        loopBodyPos_ = 0;
+        loopStmt_ = stmt;
+        expandStmtBody(stmt->body.get(), loopBodyStmts_);
+        inLoopSubstep_ = true;
+        return stmt->lineNumber;
+    }
+
+    // runAll mode: iterate all elements
     auto iterateElements = [&](auto& vec) {
         for (auto& elem : vec) {
             if (onYield_) onYield_();
