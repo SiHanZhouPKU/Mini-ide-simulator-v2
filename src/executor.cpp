@@ -45,28 +45,30 @@ bool Executor::isFinished() const { return finished_; }
 void Executor::runAll() {
     if (!prog_ || !prog_->mainFunc) return;
     reset();
-    std::vector<Stmt*> allStmts;
-    for (auto& stmt : prog_->mainFunc->body)
-        collectStmts(stmt.get(), allStmts);
-    stepQueue_ = allStmts;
-    stepPos_ = 0;
-    while (stepPos_ < stepQueue_.size() && error_.empty())
-        step();
+    // Directly execute main function body — compound statements
+    // (if/while/for) handle their own recursion via execIf/execWhile/execFor.
+    // No more pre-flattening, which caused double-execution of both if branches.
+    for (auto& stmt : prog_->mainFunc->body) {
+        int line = execStmt(stmt.get());
+        if (!error_.empty()) break;
+        takeSnapshot(stmt->lineNumber);
+        executedCount_++;
+    }
+    finished_ = true;
     if (onFinish_) onFinish_();
 }
 
 void Executor::collectStmts(Stmt* stmt, std::vector<Stmt*>& out) {
-    out.push_back(stmt);
+    // BlockStmt is transparent — expand its children so they appear directly
+    // in the step queue.  Compound statements (IfStmt, WhileStmt, ForStmt,
+    // DoWhileStmt) handle their own bodies recursively and must NOT be expanded;
+    // otherwise the un-taken if-branch ends up in the queue and gets executed
+    // when it shouldn't.
     if (auto* blk = dynamic_cast<BlockStmt*>(stmt)) {
         for (auto& s : blk->stmts)
             collectStmts(s.get(), out);
-    } else if (auto* ifs = dynamic_cast<IfStmt*>(stmt)) {
-        collectStmts(ifs->thenBody.get(), out);
-        if (ifs->elseBody) collectStmts(ifs->elseBody.get(), out);
-    } else if (auto* ws = dynamic_cast<WhileStmt*>(stmt)) {
-        collectStmts(ws->body.get(), out);
-    } else if (auto* fs = dynamic_cast<ForStmt*>(stmt)) {
-        if (fs->body) collectStmts(fs->body.get(), out);
+    } else {
+        out.push_back(stmt);
     }
 }
 
