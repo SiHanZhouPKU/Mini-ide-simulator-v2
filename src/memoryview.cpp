@@ -1,9 +1,10 @@
 #include "memoryview.h"
 #include <QPainter>
 #include <QToolTip>
+#include <algorithm>
 
 MemoryView::MemoryView(QWidget* parent) : QWidget(parent) {
-    setMinimumHeight(120);
+    setMinimumHeight(140);
     setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding);
 }
 
@@ -13,20 +14,43 @@ void MemoryView::setMemoryData(const std::map<std::string, std::pair<int, Varian
     update();
 }
 
+static int blockWidth(int byteSize) {
+    // 4 px per byte — makes container growth visually obvious
+    int w = byteSize * 4;
+    if (w < 60) w = 60;
+    if (w > 350) w = 350;
+    return w;
+}
+
+static constexpr int kBlockHeight = 82;
+static constexpr int kGapH = 6;
+static constexpr int kGapV = 6;
+static constexpr int kMargin = 10;
+
 void MemoryView::updateSizeHint() {
     if (memoryData_.empty()) {
-        setMinimumSize(200, 120);
+        setMinimumSize(200, 140);
         return;
     }
-    const int cellW = 90;
-    const int cellH = 70;
-    const int margin = 10;
-    int n = (int)memoryData_.size();
-    int cols = std::min(n, 4);
-    int rows = (n + cols - 1) / cols;
-    int totalW = cellW * cols + margin * 2 + 20;
-    int totalH = rows * cellH + margin * 2 + 60;
-    setMinimumSize(totalW, totalH);
+
+    // Flow layout: lay out blocks horizontally, wrap when exceeding a sensible width
+    int maxRowW = 0;
+    int rowW = kMargin;
+    int rows = 1;
+
+    for (const auto& [name, addrVal] : memoryData_) {
+        int bw = blockWidth(addrVal.second.byteSize());
+        if (rowW + bw + kGapH > 1100) {  // wrap at ~1100px
+            maxRowW = std::max(maxRowW, rowW);
+            rowW = kMargin;
+            rows++;
+        }
+        rowW += bw + kGapH;
+    }
+    maxRowW = std::max(maxRowW, rowW);
+
+    int totalH = rows * (kBlockHeight + kGapV) + kMargin * 2 + 30;
+    setMinimumSize(std::min(maxRowW + 20, 1120), totalH);
 }
 
 void MemoryView::clear() {
@@ -73,7 +97,6 @@ void MemoryView::paintEvent(QPaintEvent*) {
 
     // Background
     painter.fillRect(0, 0, w, h, QColor(30, 30, 30));
-    painter.setPen(QColor(60, 60, 60));
 
     if (memoryData_.empty()) {
         painter.setPen(QColor(140, 140, 140));
@@ -85,79 +108,93 @@ void MemoryView::paintEvent(QPaintEvent*) {
         return;
     }
 
-    // Calculate total memory cells needed
-    // Each cell is 32px wide, variable name + address + value
-    const int cellW = 90;
-    const int cellH = 70;
-    const int margin = 10;
-    const int startX = margin;
-
-    int x = startX;
-    int y = margin;
-
-    // Draw title
+    // Title bar
     painter.setPen(QColor(200, 200, 200));
     QFont titleFont = painter.font();
     titleFont.setPointSize(11);
     titleFont.setBold(true);
     painter.setFont(titleFont);
-    painter.drawText(0, 0, w, 22, Qt::AlignCenter, "模拟内存布局 (4 字节对齐)");
+    painter.drawText(0, 0, w, 22, Qt::AlignCenter,
+                     "模拟内存布局 — 块宽度 ∝ 占用字节数");
 
-    y = 26;
+    // Flow layout
+    int x = kMargin;
+    int y = 26;
 
-    painter.setFont(QFont("Courier New", 10));
-
-    int count = 0;
     for (const auto& [name, addrVal] : memoryData_) {
         int addr = addrVal.first;
         const VariantValue& val = addrVal.second;
+        int byteSz = val.byteSize();
+        int bw = blockWidth(byteSz);
         QColor bg = colorForType(val.type);
 
-        // Cell background
-        painter.fillRect(x, y, cellW, cellH, bg);
-        painter.setPen(Qt::white);
-        painter.drawRect(x, y, cellW, cellH);
-
-        // Address
-        painter.setPen(QColor(40, 40, 40));
-        QString addrStr = QString("0x%1").arg(addr, 0, 16);
-        painter.drawText(x + 2, y + 2, cellW - 4, 14, Qt::AlignLeft | Qt::AlignTop, addrStr);
-
-        // Variable name
-        painter.setPen(Qt::white);
-        QString nameStr = QString::fromStdString(name);
-        painter.drawText(x + 2, y + 16, cellW - 4, 14, Qt::AlignLeft | Qt::AlignTop,
-                         nameStr + ":");
-
-        // Value
-        painter.setPen(QColor(255, 255, 200));
-        QString valStr = QString::fromStdString(val.toString());
-        painter.drawText(x + 2, y + 30, cellW - 4, 18, Qt::AlignLeft | Qt::AlignTop, valStr);
-
-        // Type
-        painter.setPen(QColor(40, 40, 40));
-        QString typeStr = QString::fromStdString(val.typeName());
-        painter.drawText(x + 2, y + 48, cellW - 4, 14, Qt::AlignLeft | Qt::AlignTop, typeStr);
-
-        x += cellW + 4;
-        count++;
-
-        // Wrap to next row
-        if (x + cellW + margin > w && count % 4 == 0) {
-            x = startX;
-            y += cellH + 4;
+        // Wrap to next row if needed
+        if (x + bw > w - kMargin && x > kMargin) {
+            x = kMargin;
+            y += kBlockHeight + kGapV;
         }
+
+        // Block background + border
+        painter.fillRect(x, y, bw, kBlockHeight, bg);
+        painter.setPen(QPen(Qt::white, 1));
+        painter.drawRect(x, y, bw, kBlockHeight);
+
+        // ---- Address range ----
+        int endAddr = addr + byteSz;
+        painter.setPen(QColor(40, 40, 40));
+        QFont addrFont("Courier New", 8);
+        addrFont.setBold(true);
+        painter.setFont(addrFont);
+        QString addrStr = QString("0x%1 – 0x%2")
+            .arg(addr, 0, 16).arg(endAddr, 0, 16);
+        painter.drawText(x + 3, y + 2, bw - 6, 14,
+                         Qt::AlignLeft | Qt::AlignTop, addrStr);
+
+        // ---- Variable name ----
+        painter.setPen(Qt::white);
+        QFont nameFont("Microsoft YaHei", 9);
+        nameFont.setBold(true);
+        painter.setFont(nameFont);
+        QString nameStr = QString::fromStdString(name);
+        painter.drawText(x + 3, y + 17, bw - 6, 18,
+                         Qt::AlignLeft | Qt::AlignTop, nameStr);
+
+        // ---- Value (elide if too long) ----
+        painter.setPen(QColor(255, 255, 200));
+        QFont valFont("Courier New", 8);
+        painter.setFont(valFont);
+        QString valStr = QString::fromStdString(val.toString());
+        // Truncate long values for narrow blocks
+        QFontMetrics fm(valFont);
+        if (fm.horizontalAdvance(valStr) > bw - 6) {
+            valStr = fm.elidedText(valStr, Qt::ElideRight, bw - 6);
+        }
+        painter.drawText(x + 3, y + 35, bw - 6, 18,
+                         Qt::AlignLeft | Qt::AlignTop, valStr);
+
+        // ---- Type + byte size ----
+        painter.setPen(QColor(40, 40, 40));
+        QFont typeFont("Courier New", 8);
+        painter.setFont(typeFont);
+        QString typeStr = QString::fromStdString(val.typeName())
+                          + QString("  (%1 B)").arg(byteSz);
+        painter.drawText(x + 3, y + 55, bw - 6, 18,
+                         Qt::AlignLeft | Qt::AlignTop, typeStr);
+
+        x += bw + kGapH;
     }
 
-    // Draw "arrow" pointing to next free address
+    // "Next free address" indicator
     if (!memoryData_.empty()) {
         auto last = memoryData_.rbegin();
-        int nextAddr = last->second.first + 4;
-        painter.setPen(QColor(100, 100, 100));
-        int arrowX = x + 4;
-        if (arrowX + 60 < w) {
-            painter.drawText(arrowX, y, 60, 20, Qt::AlignLeft,
-                             QString("… → 0x%1").arg(nextAddr, 0, 16));
+        int nextAddr = last->second.first + last->second.second.byteSize();
+        painter.setPen(QColor(120, 120, 120));
+        QFont hintFont("Courier New", 9);
+        painter.setFont(hintFont);
+        int hintY = y + kBlockHeight + 8;
+        if (hintY + 16 < h) {
+            painter.drawText(x + 4, hintY, 200, 16, Qt::AlignLeft,
+                             QString("→ 下一空闲: 0x%1").arg(nextAddr, 0, 16));
         }
     }
 }
