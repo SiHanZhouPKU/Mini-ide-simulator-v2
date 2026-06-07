@@ -15,10 +15,12 @@ void MemoryView::setMemoryData(const std::map<std::string, std::pair<int, Varian
 }
 
 static int blockWidth(int byteSize) {
-    // 4 px per byte — makes container growth visually obvious
-    int w = byteSize * 4;
-    if (w < 60) w = 60;
-    if (w > 350) w = 350;
+    // 5 px per byte — small types stay narrow, containers/long strings stand out
+    // e.g. int(4B)=36px  double(8B)=40px  "Hi"(3B)=36px  "C++ Programming"(16B)=80px
+    //      vector<int> empty(16B)=80px  3-elem(28B)=140px
+    int w = byteSize * 5;
+    if (w < 36) w = 36;
+    if (w > 380) w = 380;
     return w;
 }
 
